@@ -21,6 +21,7 @@ import armada_turnip
 BASE_FEX_CONFIG = pathlib.Path("/usr/share/fex-emu/Config.json")
 FEX_PROFILES_CONFIG = pathlib.Path("/usr/share/armada/fex-profiles.json")
 PROTON_INJECT_SRC = pathlib.Path("/usr/share/armada/proton-inject/x86_64-linux-gnu")
+SSBS_PRELOAD = pathlib.Path("/usr/lib/armada/libssbs.so")
 SYSTEM_EXEC_PATHS = ("/usr/bin", "/usr/local/bin", "/bin")
 # The guest rootfs's stock Turnip, for x86 games; absent on the host, so native loaders skip it.
 GUEST_TURNIP_MANIFESTS = (
@@ -167,6 +168,18 @@ def inject_x86_protocol_libs():
                 os.symlink(os.readlink(src), dest)
             else:
                 shutil.copy2(src, dest)
+
+
+def preload_ssbs():
+    if not SSBS_PRELOAD.is_file():
+        return
+    tools = os.environ.get("STEAM_COMPAT_TOOL_PATHS", "").split(":")
+    if not any(tool and (pathlib.Path(tool) / "files" / "bin-arm64").is_dir() for tool in tools):
+        return
+    preload = [entry for entry in os.environ.get("LD_PRELOAD", "").split(":") if entry]
+    if str(SSBS_PRELOAD) in preload:
+        return
+    os.environ["LD_PRELOAD"] = ":".join([str(SSBS_PRELOAD)] + preload)
 
 
 def apply_perf(settings, game_id):
@@ -322,6 +335,11 @@ def main():
 
     if not os.environ.get("PATH"):
         os.environ["PATH"] = os.pathsep.join(SYSTEM_EXEC_PATHS)
+
+    try:
+        preload_ssbs()
+    except Exception as exc:
+        print(f"armada-game-launch: ssbs preload skipped: {exc}", file=sys.stderr)
 
     try:
         apply_perf(settings, game_id)
