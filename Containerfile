@@ -92,6 +92,11 @@ RUN npm ci
 COPY decky/armada-store/ ./
 RUN npm run build
 
+FROM ${BASE_IMAGE} AS ssbs-preload-build
+RUN dnf -y install gcc glibc-devel
+COPY ssbs-preload/ssbs_adapter.c /build/
+RUN gcc -O2 -fPIC -shared -Wall -Wextra -Werror -D_GNU_SOURCE -o /build/libssbs.so /build/ssbs_adapter.c -ldl
+
 FROM scratch AS ctx
 COPY abl /abl/
 COPY build_files /build_files/
@@ -125,6 +130,7 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=lepton,source=/rpms,target=/packages/lepton \
     --mount=type=bind,from=mesa-x86,source=/,target=/packages/mesa-x86 \
     --mount=type=bind,from=extest,source=/,target=/packages/extest \
+    --mount=type=bind,from=ssbs-preload-build,source=/build,target=/packages/ssbs-preload \
     --mount=type=bind,from=armada-splash,source=/rpms,target=/packages/armada-splash \
     --mount=type=bind,from=armada-rgb,source=/rpms,target=/packages/armada-rgb \
     --mount=type=bind,from=umtp-responder,source=/rpms,target=/packages/umtp-responder \
