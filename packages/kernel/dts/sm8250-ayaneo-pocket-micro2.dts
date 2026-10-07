@@ -244,6 +244,22 @@
 		};
 	};
 
+	typec_sbu_mux: usb-c-sbu-mux {
+		compatible = "gpio-sbu-mux";
+
+		select-gpios = <&tlmm 62 GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;
+
+		orientation-switch;
+		mode-switch;
+
+		port {
+			sbu_mux_usb_con: endpoint {
+				remote-endpoint = <&pm8150b_typec_sbu_out>;
+			};
+		};
+	};
+
 	vph_pwr: vph-pwr-regulator {
 		compatible = "regulator-fixed";
 		regulator-name = "vph_pwr";
@@ -516,7 +532,12 @@
 };
 
 &mdss_dp {
-	status = "disabled";
+	status = "okay";
+};
+
+&mdss_dp_out {
+	data-lanes = <0 1>;
+	remote-endpoint = <&usb_1_qmpphy_dp_in>;
 };
 
 &mdss_dsi0 {
@@ -637,6 +658,13 @@
 
 		op-sink-microwatt = <15000000>;
 
+		altmodes {
+			displayport {
+				svid = /bits/ 16 <0xff01>;
+				vdo = <0x00001c46>;
+			};
+		};
+
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -652,6 +680,14 @@
 				reg = <1>;
 				pm8150b_typec_mux_in: endpoint {
 					remote-endpoint = <&usb_1_qmpphy_out>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+
+				pm8150b_typec_sbu_out: endpoint {
+					remote-endpoint = <&sbu_mux_usb_con>;
 				};
 			};
 		};
@@ -1090,6 +1126,10 @@
 
 	vdda-phy-supply = <&vreg_l9a_1p2>;
 	vdda-pll-supply = <&vreg_l18a_0p92>;
+};
+
+&usb_1_qmpphy_dp_in {
+	remote-endpoint = <&mdss_dp_out>;
 };
 
 &usb_1_qmpphy_out {
