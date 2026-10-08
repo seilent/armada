@@ -9,6 +9,9 @@ install -Dpm 0755 /packages/ssbs-preload/libssbs.so /usr/lib/armada/libssbs.so
 # would not otherwise list them.
 update-desktop-database -q /usr/share/applications
 
+install -Dpm 0755 /packages/hexagonrpc/usr/bin/hexagonrpcd /usr/bin/hexagonrpcd
+install -Dpm 0755 /packages/hexagonrpc/usr/lib64/libhexagonrpc.so.0.5 /usr/lib64/libhexagonrpc.so.0.5
+
 cp -a /packages/mesa-android/waydroid/vendor /usr/share/armada/waydroid/
 
 mesa_sqsh=/usr/share/fex-emu/RootFS/ArmadaMesa.sqsh

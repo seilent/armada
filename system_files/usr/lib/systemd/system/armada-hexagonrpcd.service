@@ -1,0 +1,16 @@
+[Unit]
+Description=armada FastRPC server for the SLPI sensor DSP
+BindsTo=dev-fastrpc\x2dsdsp.device
+After=dev-fastrpc\x2dsdsp.device armada-slpi-sensors.service
+ConditionPathExists=/var/lib/armada/sensors/.armada-source
+ConditionPathExists=/dev/fastrpc-sdsp
+
+[Service]
+ExecStart=/usr/bin/hexagonrpcd -f /dev/fastrpc-sdsp -d sdsp -s -R /var/lib/armada/sensors
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/armada/sensors
