@@ -792,6 +792,11 @@
 	no-mmc;
 };
 
+&slpi {
+	status = "okay";
+	firmware-name = "qcom/sm8250/ayaneo/pocketmicro2/slpi.mdt";
+};
+
 &sound {
 	compatible = "qcom,sm8250-sndcard";
 	model = "PocketMICRO2";
