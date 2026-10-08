@@ -19,6 +19,7 @@ Patch1:         0001-fix-gamepad-share-raw-input.patch
 Patch2:         0002-fix-force-feedback-reset-effects-when-replacing-targets.patch
 Patch3:         0003-fix-AyaneoHaptics-sleep-between-polls.patch
 Patch4:         0004-fix-Hardware-Support-KONKR-Pocket-FIT-MCU-system-buttons.patch
+Patch5:         0005-feat-source-add-Qualcomm-SSC-IMU-source.patch
 
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -41,8 +42,8 @@ Requires:       dbus
 %description
 InputPlumber detects, manages, and routes input from handheld gaming devices,
 including combining devices into a single virtual gamepad. The Armada fork adds
-automatic raw gamepad sharing and resets force-feedback effects when replacing
-or suspending virtual targets.
+automatic raw gamepad sharing, resets force-feedback effects when replacing
+or suspending virtual targets, and reads IMUs behind the Qualcomm Sensor Core.
 
 %prep
 %autosetup -n %{appname}-%{commit} -p1
