@@ -1,0 +1,209 @@
+#!/bin/bash
+set -euo pipefail
+shopt -s nullglob
+
+device_env=${ARMADA_DEVICE_ENV:-/usr/libexec/armada/device-env}
+root=${ARMADA_SENSORS_ROOT:-/var/lib/armada/sensors}
+firmware_path=${ARMADA_FIRMWARE_PATH:-/var/lib/firmware}
+sysfs_root=${ARMADA_SYSFS_ROOT:-/sys}
+socinfo_debugfs=${ARMADA_SOCINFO_DEBUGFS:-/sys/kernel/debug/qcom_socinfo}
+partlabel_dir=${ARMADA_PARTLABEL_DIR:-/dev/disk/by-partlabel}
+cmdline=${ARMADA_CMDLINE:-/proc/cmdline}
+work_parent=${ARMADA_WORK_PARENT:-/run}
+
+eval "$("$device_env")"
+[[ "${ARMADA_SLPI_SENSORS:-0}" == 1 ]] || exit 0
+if [[ -z "${ARMADA_SLPI_FIRMWARE_DIR:-}" ]]; then
+    echo "slpi-sensors: ARMADA_SLPI_FIRMWARE_DIR is not set" >&2
+    exit 1
+fi
+firmware_dir=$firmware_path/$ARMADA_SLPI_FIRMWARE_DIR
+
+excluded=(dsp/sdsp/wigig_sensing.so dsp/sdsp/sns_bring_to_ear.so)
+
+slot=_a
+read -ra cmdline_args <"$cmdline" || true
+for arg in "${cmdline_args[@]}"; do
+    case "$arg" in
+        androidboot.slot_suffix=_a|androidboot.slot_suffix=_b) slot=${arg#*=} ;;
+    esac
+done
+echo "slpi-sensors: using slot $slot"
+
+work=$(mktemp -d "$work_parent/armada-slpi.XXXXXX")
+staged=()
+cleanup() {
+    local mnt
+    for mnt in "$work"/mnt/*; do
+        if mountpoint -q "$mnt"; then
+            umount "$mnt"
+        fi
+    done
+    rm -rf --one-file-system -- "$work" "${staged[@]}"
+}
+trap cleanup EXIT
+mkdir "$work/mnt"
+
+mount_part() {
+    local label=$1 type=$2 dev opts=ro
+
+    if ! udevadm wait --timeout=30 "$partlabel_dir/$label"; then
+        echo "slpi-sensors: partition $label not found" >&2
+        return 1
+    fi
+    dev=$(readlink -f "$partlabel_dir/$label")
+    if [[ "$(blkid -o value -s TYPE "$dev")" != "$type" ]]; then
+        echo "slpi-sensors: partition $label is not $type" >&2
+        return 1
+    fi
+    blockdev --setro "$dev"
+    [[ "$type" == ext4 ]] && opts=ro,noload
+    mkdir "$work/mnt/$label"
+    mount -t "$type" -o "$opts" "$dev" "$work/mnt/$label"
+}
+
+exclude_args() {
+    local dest=$1 path
+
+    find_excludes=()
+    for path in "${excluded[@]}"; do
+        if [[ "$path" == "$dest"/* ]]; then
+            find_excludes+=(! -path "./${path#"$dest"/}")
+        fi
+    done
+}
+
+tree_sum() {
+    local entry
+
+    for entry in "$@"; do
+        exclude_args "${entry%%=*}"
+        printf '%s\n' "${entry%%=*}"
+        (
+            cd -- "${entry#*=}" || exit 1
+            find . "${find_excludes[@]}" -printf '%y %p %l\n' | LC_ALL=C sort
+            find . -type f "${find_excludes[@]}" -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+        )
+    done | sha256sum | cut -d ' ' -f 1
+}
+
+install_tree() {
+    local dest=$1 unit=$2 sum stage old entry path active=0 status=0
+    shift 2
+
+    sum=$(tree_sum "$@")
+    if [[ -r "$dest/.armada-source" && "$(<"$dest/.armada-source")" == "$sum" ]]; then
+        echo "slpi-sensors: $dest up to date"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    stage=$(mktemp -d "$dest.XXXXXX")
+    staged+=("$stage")
+    chmod 0755 "$stage"
+    for entry in "$@"; do
+        mkdir -p "$stage/${entry%%=*}"
+        cp -RP "${entry#*=}/." "$stage/${entry%%=*}/"
+    done
+    for path in "${excluded[@]}"; do
+        rm -rf -- "${stage:?}/$path"
+    done
+    printf '%s\n' "$sum" >"$stage/.armada-source"
+    if [[ -n "$unit" ]] && systemctl -q is-active "$unit"; then
+        systemctl stop "$unit"
+        active=1
+    fi
+    if [[ -e "$dest" ]]; then
+        old=$(mktemp -d "$dest.XXXXXX")
+        staged+=("$old")
+        mv -T "$dest" "$old/tree" || status=$?
+    fi
+    if (( ! status )); then
+        mv -T "$stage" "$dest" || status=$?
+    fi
+    if (( active )); then
+        systemctl --no-block start "$unit" || echo "slpi-sensors: starting $unit failed" >&2
+    fi
+    if (( status )); then
+        return "$status"
+    fi
+    echo "slpi-sensors: installed $dest"
+}
+
+mount_part "modem$slot" vfat
+mount_part "dsp$slot" ext4
+mount_part persist ext4
+
+image=$work/mnt/modem$slot/image
+if [[ ! -f "$image/slpi.mdt" ]]; then
+    echo "slpi-sensors: slpi.mdt not found on modem$slot" >&2
+    exit 1
+fi
+fw_src=$work/firmware
+mkdir "$fw_src"
+cp -P "$image"/slpi.mdt "$image"/slpi.b[0-9][0-9] "$fw_src/"
+
+sdsp=$work/mnt/dsp$slot/sdsp
+if [[ ! -d "$sdsp" ]]; then
+    echo "slpi-sensors: sdsp not found on dsp$slot" >&2
+    exit 1
+fi
+
+registry=$work/mnt/persist/sensors/registry/registry
+if [[ ! -d "$registry" ]]; then
+    echo "slpi-sensors: sensors registry not found on persist" >&2
+    exit 1
+fi
+
+root_src=$work/root
+mkdir -p "$root_src/sensors" "$root_src/socinfo"
+cat >"$root_src/sensors/sns_reg.conf" <<'EOF'
+version=1
+file=hw_platform=/sys/devices/soc0/hw_platform
+file=platform_subtype=/sys/devices/soc0/platform_subtype
+file=platform_subtype_id=/sys/devices/soc0/platform_subtype_id
+file=platform_version=/sys/devices/soc0/platform_version
+file=soc_id=/sys/devices/soc0/soc_id
+file=revision=/sys/devices/soc0/revision
+file=output=/mnt/vendor/persist/sensors/registry/registry
+property=persist.vendor.sensors.enable.property=/mnt/vendor/persist/sensors/registry/file1
+property=persist.vendor.sensors.enable.property1=/mnt/vendor/persist/sensors/registry/file2
+EOF
+
+for file in family machine revision soc_id serial_number; do
+    cat "$sysfs_root/devices/soc0/$file" >"$root_src/socinfo/$file"
+done
+read -r hw_id 2>/dev/null <"$socinfo_debugfs/hardware_platform" || hw_id=11
+read -r subtype_id 2>/dev/null <"$socinfo_debugfs/hardware_platform_subtype" || subtype_id=0
+read -r platform_version 2>/dev/null <"$socinfo_debugfs/platform_version" || platform_version=65536
+if [[ "$hw_id" != 11 || "$subtype_id" != 0 ]]; then
+    echo "slpi-sensors: hardware platform $hw_id subtype $subtype_id, reporting QRD" >&2
+fi
+printf 'QRD\n' >"$root_src/socinfo/hw_platform"
+printf 'QRD\n' >"$root_src/socinfo/platform_subtype"
+printf '%s\n' "$subtype_id" >"$root_src/socinfo/platform_subtype_id"
+printf '%s\n' "$platform_version" >"$root_src/socinfo/platform_version"
+
+install_tree "$firmware_dir" "" ".=$fw_src"
+install_tree "$root" armada-hexagonrpcd.service ".=$root_src" "dsp/sdsp=$sdsp" \
+    "sensors/registry=$registry"
+
+cleanup
+trap - EXIT
+
+printf '%s' "$firmware_path" >"$sysfs_root/module/firmware_class/parameters/path"
+started=0
+for rproc in "$sysfs_root"/class/remoteproc/remoteproc*; do
+    [[ "$(<"$rproc/name")" == slpi ]] || continue
+    state=$(<"$rproc/state")
+    if [[ "$state" == offline ]]; then
+        echo start >"$rproc/state"
+        echo "slpi-sensors: started ${rproc##*/}"
+    else
+        echo "slpi-sensors: ${rproc##*/} is $state"
+    fi
+    started=1
+done
+if (( ! started )); then
+    echo "slpi-sensors: no slpi remoteproc" >&2
+    exit 1
+fi
