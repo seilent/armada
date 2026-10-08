@@ -1,0 +1,59 @@
+#!/bin/bash
+set -u
+
+flag=/run/pm2-dp-audio
+
+dp_connected() {
+    local s
+    for s in /sys/class/drm/card*-DP-*/status; do
+        [ "$(cat "$s" 2>/dev/null)" = connected ] && return 0
+    done
+    return 1
+}
+
+card=
+for c in /sys/class/sound/card*; do
+    [ "$(cat "$c/id" 2>/dev/null)" = PocketMICRO2 ] && card=$c
+done
+[ -n "${card}" ] || exit 0
+exec 9>/run/pm2-dp-audio.lock
+flock -w 300 9 || exit 1
+n=${card##*card}
+mix="name=DISPLAY_PORT_RX Audio Mixer MultiMedia4"
+
+reprobe() {
+    udevadm trigger --action=remove "${card}"
+    sleep 1
+    udevadm trigger --action=add "${card}"
+}
+
+drop_dp() {
+    if [ -e "${flag}" ]; then
+        rm -f "${flag}"
+        reprobe
+        logger -t pm2-dp-audio-reprobe "DP audio removed from card${n}"
+    fi
+    amixer -q -D "hw:${n}" cset "${mix}" 0
+}
+
+for try in $(seq 1 18); do
+    if ! dp_connected; then
+        drop_dp
+        exit 0
+    fi
+    [ -e "${flag}" ] && exit 0
+    amixer -q -D "hw:${n}" cset "${mix}" 1
+    if timeout 5 aplay -q -D "hw:${n},3" -f S16_LE -r 48000 -c 2 -d 1 /dev/zero 2>/dev/null; then
+        since=$(date +%s)
+        logger -t pm2-dp-audio-reprobe "DP audio ready (try ${try}), adding it to card${n}"
+        touch "${flag}"
+        reprobe
+        sleep 15
+        journalctl -k -q --no-pager --since "@${since}" | grep -q "port 0x6020 failed" || exit 0
+        logger -t pm2-dp-audio-reprobe "probe hit a refused DP start, retrying"
+        drop_dp
+    fi
+    sleep 7
+done
+drop_dp
+logger -t pm2-dp-audio-reprobe "DP audio never became ready, giving up"
