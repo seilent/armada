@@ -7,6 +7,8 @@ cp -a /packages/mesa/turnip /usr/share/armada/turnip
 
 # Is this still needed? If so, can we make it an rpm. This is messy
 install -Dpm 0755 /packages/extest/libextest.so /usr/lib/extest/libextest.so
+install -Dpm 0755 /packages/hexagonrpc/usr/bin/hexagonrpcd /usr/bin/hexagonrpcd
+install -Dpm 0755 /packages/hexagonrpc/usr/lib64/libhexagonrpc.so.0.5 /usr/lib64/libhexagonrpc.so.0.5
 
 # Patched mesa for waydroid, fixes SM8750 display problems
 mkdir -p /usr/share/armada/waydroid

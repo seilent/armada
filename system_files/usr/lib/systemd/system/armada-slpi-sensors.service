@@ -1,0 +1,11 @@
+[Unit]
+Description=armada SLPI sensor DSP setup
+Wants=sys-kernel-debug.mount
+After=sys-kernel-debug.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/armada/slpi-sensors
+StandardOutput=journal
+StandardError=journal
