@@ -1,0 +1,2 @@
+SUBSYSTEM=="remoteproc", ATTR{name}=="slpi", TAG+="systemd", ENV{SYSTEMD_WANTS}+="armada-slpi-sensors.service"
+KERNEL=="fastrpc-sdsp", TAG+="systemd", ENV{SYSTEMD_WANTS}+="armada-hexagonrpcd.service"
