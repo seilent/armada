@@ -80,6 +80,17 @@ FROM ${ARMADA_RGB_REF} AS armada-rgb
 ARG UMTP_RESPONDER_REF
 FROM ${UMTP_RESPONDER_REF} AS umtp-responder
 
+FROM ${BASE_IMAGE} AS hexagonrpc-build
+ARG HEXAGONRPC_COMMIT=da7a3742ab8d5273a281b70ee11f16fb2cb6a690
+ARG HEXAGONRPC_SHA256=651ab53dcf92a2766ba6ec42cac2ccdbd67382da5211b14c5fa33b618153c435
+RUN dnf -y install curl gcc meson ninja-build && \
+    curl -fsSL -o /tmp/hexagonrpc.tar.gz "https://github.com/linux-msm/hexagonrpc/archive/${HEXAGONRPC_COMMIT}.tar.gz" && \
+    echo "${HEXAGONRPC_SHA256}  /tmp/hexagonrpc.tar.gz" | sha256sum -c && \
+    mkdir /src && tar -xzf /tmp/hexagonrpc.tar.gz -C /src --strip-components=1 && \
+    meson setup --prefix=/usr --libdir=lib64 --buildtype=release /src/build /src && \
+    meson compile -C /src/build && \
+    meson install -C /src/build --destdir /build
+
 FROM docker.io/library/node:22-slim AS decky-build
 WORKDIR /build/armada-control
 COPY decky/armada-control/package.json decky/armada-control/package-lock.json ./
@@ -128,6 +139,7 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=bind,from=jupiter-hw-support,source=/rpms,target=/packages/jupiter-hw-support \
     --mount=type=bind,from=mesa-android,source=/,target=/packages/mesa-android \
     --mount=type=bind,from=lepton,source=/rpms,target=/packages/lepton \
+    --mount=type=bind,from=hexagonrpc-build,source=/build,target=/packages/hexagonrpc \
     --mount=type=bind,from=mesa-x86,source=/,target=/packages/mesa-x86 \
     --mount=type=bind,from=extest,source=/,target=/packages/extest \
     --mount=type=bind,from=ssbs-preload-build,source=/build,target=/packages/ssbs-preload \
