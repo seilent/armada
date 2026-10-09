@@ -96,6 +96,18 @@ if [[ "${ARMADA_SYNC_SUSPEND:-0}" == "1" ]]; then
     fi
 fi
 
+platform_devices=${ARMADA_PLATFORM_DEVICES:-/sys/bus/platform/devices}
+for dev in ${ARMADA_SLEEP_NO_WAKEUP:-}; do
+    wakeup=$platform_devices/$dev/power/wakeup
+    if [[ ! -w "$wakeup" ]]; then
+        echo "device-quirks: $wakeup not writable, skipping" >&2
+        continue
+    fi
+    if ! echo disabled >"$wakeup"; then
+        echo "device-quirks: failed to disable wakeup on $dev" >&2
+    fi
+done
+
 if [[ "${ARMADA_SOC_CLASS:-}" == "SM8550" ]]; then
     # SM8550 UFS needs up to 3 seconds for UIC completion across suspend.
     uic_timeout=/sys/module/ufshcd_core/parameters/uic_cmd_timeout
