@@ -1,0 +1,47 @@
+#!/bin/bash
+set -uo pipefail
+
+device_env=${ARMADA_DEVICE_ENV:-/usr/libexec/armada/device-env}
+sdw_root=${ARMADA_SDW_ROOT:-/sys/bus/soundwire/devices}
+run_dir=${ARMADA_RUN_DIR:-/run/armada}
+state=$run_dir/sdw-sleep
+
+case "${2:-}" in
+    suspend|suspend-then-hibernate|hybrid-sleep) ;;
+    *) exit 0 ;;
+esac
+
+case "${1:-}" in
+    pre)
+        eval "$("$device_env")"
+        pattern=${ARMADA_SLEEP_SDW_SLAVES:-}
+        [[ -n "$pattern" ]] || exit 0
+        mkdir -p "$run_dir" && : >"$state" || exit 0
+        for dev in "$sdw_root"/$pattern; do
+            control=$dev/power/control
+            [[ -w "$control" && "$(<"$control")" == on ]] || continue
+            if echo auto >"$control"; then
+                printf '%s\n' "$dev" >>"$state"
+            else
+                printf 'armada-sdw-sleep: releasing %s failed\n' "$dev" >&2
+            fi
+        done
+        for _ in {1..20}; do
+            busy=0
+            while IFS= read -r dev; do
+                [[ "$(<"$dev/power/runtime_status")" == suspended ]] || busy=1
+            done <"$state"
+            ((busy)) || break
+            sleep 0.05
+        done
+        ;;
+    post)
+        [[ -r "$state" ]] || exit 0
+        while IFS= read -r dev; do
+            echo on >"$dev/power/control" ||
+                printf 'armada-sdw-sleep: pinning %s failed\n' "$dev" >&2
+        done <"$state"
+        rm -f -- "$state"
+        ;;
+esac
+exit 0
