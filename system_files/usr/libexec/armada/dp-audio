@@ -1,0 +1,146 @@
+#!/bin/bash
+set -uo pipefail
+
+eval "$("${ARMADA_DEVICE_ENV:-/usr/libexec/armada/device-env}")"
+card=${ARMADA_DP_AUDIO_CARD:-}
+device=${ARMADA_DP_AUDIO_DEVICE:-}
+route=${ARMADA_DP_AUDIO_ROUTE:-}
+if [ -z "${card}" ] || [ -z "${device}" ]; then
+    [ "${1:-}" = --supported ] && exit 1
+    exit 0
+fi
+[ "${1:-}" = --supported ] && exit 0
+
+run=${ARMADA_DP_AUDIO_RUN_DIR:-/run}
+asound=${ARMADA_DP_AUDIO_ASOUND_DIR:-/proc/asound}
+drm=${ARMADA_DP_AUDIO_DRM_DIR:-/sys/class/drm}
+uptime=${ARMADA_DP_AUDIO_UPTIME:-/proc/uptime}
+lock_wait=${ARMADA_DP_AUDIO_LOCK_WAIT:-60}
+deadline=200
+tries=18
+flag=${run}/armada-dp-audio.${card}
+sleeping=${run}/armada-dp-audio.sleeping
+status=${asound}/${card}/pcm${device}p/sub0/status
+units='armada-dp-audio-hotplug-*.service'
+
+dp_state() {
+    local s
+    for s in "${drm}"/card*-DP-*/status; do
+        [ "$(cat "$s" 2>/dev/null)" = connected ] && { echo connected; return; }
+    done
+    echo disconnected
+}
+
+past_deadline() {
+    local now
+    [ -n "${t0}" ] && now=$(uptime_cs) && ((now - t0 > deadline * 100))
+}
+
+uptime_cs() {
+    local up
+    read -r up _ <"${uptime}" || return 1
+    [[ ${up} =~ ^[0-9]+\.[0-9]{2}$ ]] || return 1
+    echo $((10#${up/./}))
+}
+
+set_route() {
+    [ -n "${route}" ] || return 0
+    amixer -q -D "hw:${card}" cset "name=${route}" "$1"
+}
+
+drop_dp() {
+    if [ -e "${flag}" ]; then
+        rm -f "${flag}"
+        logger -t armada-dp-audio "DP audio removed"
+    fi
+    for _ in $(seq 1 15); do
+        [ "$(cat "${status}" 2>/dev/null)" = closed ] && break
+        sleep 0.1
+    done
+    [ "$(cat "${status}" 2>/dev/null)" = closed ] ||
+        logger -t armada-dp-audio "DP PCM still open, clearing the route anyway"
+    set_route 0
+}
+
+start_dp() {
+    local try out rc
+    sleep 3
+    for try in $(seq 1 "${tries}"); do
+        if [ -e "${sleeping}" ]; then
+            set_route 0
+            return 0
+        fi
+        [ "$(dp_state)" = connected ] || return 1
+        if past_deadline; then
+            logger -t armada-dp-audio "DP audio not ready ${deadline} s after the run started, giving up"
+            drop_dp
+            return 0
+        fi
+        set_route 1
+        out=$(timeout 5 aplay -q -D "hw:CARD=${card},DEV=${device}" -f S16_LE -r 48000 -c 2 -d 1 /dev/zero 2>&1)
+        rc=$?
+        if [ "${rc}" = 0 ]; then
+            if [ -e "${sleeping}" ]; then
+                set_route 0
+                return 0
+            fi
+            touch "${flag}"
+            if [ -e "${sleeping}" ]; then
+                rm -f "${flag}"
+                set_route 0
+                return 0
+            fi
+            logger -t armada-dp-audio "DP audio ready (try ${try})"
+            return 0
+        fi
+        logger -t armada-dp-audio "DP audio try ${try} failed (rc ${rc}): ${out##*$'\n'}"
+        ((try < tries)) && sleep 7
+    done
+    drop_dp
+    logger -t armada-dp-audio "DP audio never became ready, giving up"
+    return 0
+}
+
+t0=$(uptime_cs) || t0=""
+
+case "${1:-}" in
+sleep)
+    touch "${sleeping}"
+    timeout 1.5 systemctl stop "${units}" ||
+        logger -t armada-dp-audio "stopping ${units} failed"
+    touch "${sleeping}"
+    drop_dp
+    exit 0
+    ;;
+resume)
+    rm -f "${sleeping}"
+    ;;
+esac
+
+[ -d "${asound}/${card}" ] || exit 0
+[ -e "${sleeping}" ] && exit 0
+exec 9>"${run}/armada-dp-audio.lock"
+if ! flock -w "${lock_wait}" 9; then
+    logger -t armada-dp-audio "lock held for ${lock_wait} s, the holder covers this event"
+    exit 0
+fi
+
+while :; do
+    [ -e "${sleeping}" ] && exit 0
+    if past_deadline; then
+        logger -t armada-dp-audio "DP still changing ${deadline} s after the run started, giving up"
+        drop_dp
+        exit 0
+    fi
+    state=$(dp_state)
+    if [ "${state}" = connected ]; then
+        if [ ! -e "${flag}" ]; then
+            start_dp || continue
+        fi
+    else
+        drop_dp
+    fi
+    [ -e "${sleeping}" ] && exit 0
+    [ "$(dp_state)" = "${state}" ] && exit 0
+    logger -t armada-dp-audio "DP changed during the run, rechecking"
+done

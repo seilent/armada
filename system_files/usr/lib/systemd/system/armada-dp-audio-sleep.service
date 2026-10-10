@@ -1,0 +1,12 @@
+[Unit]
+Description=Remove the DisplayPort audio sink across suspend
+After=dbus.service systemd-logind.service
+
+[Service]
+ExecCondition=/usr/libexec/armada/dp-audio --supported
+ExecStart=/usr/libexec/armada/dp-audio-sleep
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
