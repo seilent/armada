@@ -1,0 +1,91 @@
+#!/bin/bash
+set -uo pipefail
+
+eval "$("${ARMADA_DEVICE_ENV:-/usr/libexec/armada/device-env}")"
+card=${ARMADA_DP_AUDIO_CARD:-}
+device=${ARMADA_DP_AUDIO_DEVICE:-}
+route=${ARMADA_DP_AUDIO_ROUTE:-}
+if [ -z "${card}" ] || [ -z "${device}" ]; then
+    [ "${1:-}" = --supported ] && exit 1
+    exit 0
+fi
+[ "${1:-}" = --supported ] && exit 0
+
+run=${ARMADA_DP_AUDIO_RUN_DIR:-/run}
+asound=${ARMADA_DP_AUDIO_ASOUND_DIR:-/proc/asound}
+drm=${ARMADA_DP_AUDIO_DRM_DIR:-/sys/class/drm}
+flag=${run}/armada-dp-audio.${card}
+sleeping=${run}/armada-dp-audio.sleeping
+status=${asound}/${card}/pcm${device}p/sub0/status
+
+dp_connected() {
+    local s
+    for s in "${drm}"/card*-DP-*/status; do
+        [ "$(cat "$s" 2>/dev/null)" = connected ] && return 0
+    done
+    return 1
+}
+
+set_route() {
+    [ -n "${route}" ] || return 0
+    amixer -q -D "hw:${card}" cset "name=${route}" "$1"
+}
+
+drop_dp() {
+    if [ -e "${flag}" ]; then
+        rm -f "${flag}"
+        logger -t armada-dp-audio "DP audio removed"
+    fi
+    for _ in $(seq 1 20); do
+        [ "$(cat "${status}" 2>/dev/null)" = closed ] && break
+        sleep 0.1
+    done
+    [ "$(cat "${status}" 2>/dev/null)" = closed ] ||
+        logger -t armada-dp-audio "DP PCM still open, clearing the route anyway"
+    set_route 0
+}
+
+case "${1:-}" in
+sleep)
+    touch "${sleeping}"
+    drop_dp
+    exit 0
+    ;;
+resume)
+    rm -f "${sleeping}"
+    ;;
+esac
+
+[ -d "${asound}/${card}" ] || exit 0
+[ -e "${sleeping}" ] && exit 0
+exec 9>"${run}/armada-dp-audio.lock"
+flock -w 300 9 || exit 1
+
+if ! dp_connected; then
+    drop_dp
+    exit 0
+fi
+[ -e "${flag}" ] && exit 0
+sleep 3
+
+for try in $(seq 1 18); do
+    [ -e "${sleeping}" ] && exit 0
+    if ! dp_connected; then
+        drop_dp
+        exit 0
+    fi
+    set_route 1
+    if timeout 5 aplay -q -D "hw:CARD=${card},DEV=${device}" -f S16_LE -r 48000 -c 2 -d 1 /dev/zero 2>/dev/null; then
+        [ -e "${sleeping}" ] && exit 0
+        touch "${flag}"
+        if [ -e "${sleeping}" ]; then
+            rm -f "${flag}"
+            exit 0
+        fi
+        logger -t armada-dp-audio "DP audio ready (try ${try})"
+        exit 0
+    fi
+    sleep 7
+done
+drop_dp
+logger -t armada-dp-audio "DP audio never became ready, giving up"

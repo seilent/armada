@@ -1,0 +1,4 @@
+ACTION=="change", SUBSYSTEM=="drm", ENV{HOTPLUG}=="1", IMPORT{program}="/usr/libexec/armada/device-env"
+ACTION=="change", SUBSYSTEM=="drm", ENV{HOTPLUG}=="1", ENV{ARMADA_DP_AUDIO_CARD}=="?*", RUN+="/usr/bin/systemd-run --no-block --collect /usr/libexec/armada/dp-audio"
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="card*", IMPORT{program}="/usr/libexec/armada/device-env"
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="card*", ENV{ARMADA_DP_AUDIO_CARD}=="?*", RUN+="/usr/bin/systemd-run --no-block --collect /usr/libexec/armada/dp-audio"
