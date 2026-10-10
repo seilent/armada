@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+HOOK = os.environ.get("ARMADA_DP_AUDIO_HOOK", "/usr/libexec/armada/dp-audio")
+LOGIN1_NAME = "org.freedesktop.login1"
+LOGIN1_PATH = "/org/freedesktop/login1"
+LOGIN1_IFACE = "org.freedesktop.login1.Manager"
+
+
+def resume():
+    subprocess.run(["systemd-run", "--no-block", "--collect", HOOK, "resume"])
+
+
+class DpAudioSleep:
+    def __init__(self, bus, loop=None):
+        self.bus = bus
+        self.loop = loop
+        self.failed = False
+        self.fd = None
+
+    def inhibit(self):
+        if self.fd is not None:
+            return
+        result, fds = self.bus.call_with_unix_fd_list_sync(
+            LOGIN1_NAME,
+            LOGIN1_PATH,
+            LOGIN1_IFACE,
+            "Inhibit",
+            GLib.Variant(
+                "(ssss)",
+                ("sleep", "Armada", "Remove the DisplayPort audio sink before suspend", "delay"),
+            ),
+            GLib.VariantType("(h)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+            None,
+        )
+        self.fd = fds.get(result.unpack()[0])
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def prepare_for_sleep(self, _conn, _sender, _path, _iface, _signal, params):
+        if params.unpack()[0]:
+            try:
+                subprocess.run([HOOK, "sleep"], timeout=4)
+            except subprocess.TimeoutExpired:
+                pass
+            self.release()
+        else:
+            resume()
+            try:
+                self.inhibit()
+            except GLib.Error as err:
+                print(f"dp-audio-sleep: inhibit failed: {err.message}", file=sys.stderr)
+                self.failed = True
+                self.loop.quit()
+
+
+def main():
+    resume()
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    loop = GLib.MainLoop()
+    sleeper = DpAudioSleep(bus, loop)
+    bus.signal_subscribe(
+        LOGIN1_NAME, LOGIN1_IFACE, "PrepareForSleep", LOGIN1_PATH, None,
+        Gio.DBusSignalFlags.NONE, sleeper.prepare_for_sleep,
+    )
+    sleeper.inhibit()
+    loop.run()
+    return 1 if sleeper.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
