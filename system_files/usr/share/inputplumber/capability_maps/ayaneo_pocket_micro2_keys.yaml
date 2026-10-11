@@ -24,3 +24,21 @@ mapping:
     target_event:
       gamepad:
         button: Guide
+
+  - name: LC
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: KEY_PROG3
+          value_type: button
+    target_event:
+      keyboard: KeyF14
+
+  - name: RC
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: KEY_PROG4
+          value_type: button
+    target_event:
+      keyboard: KeyF15
