@@ -1,17 +1,131 @@
 #!/usr/bin/bash
-# zz- sorts after armada.conf so its Session= wins (User=/Relogin= stay there).
-#
-# Used during early boot and when steamos-manager is unavailable to take control
-
 set -euo pipefail
 
 STEAMOS_MANAGER_STATE=/var/home/armada/.config/steamos-manager/state.toml
+SESSIONS_DIR="${ARMADA_SESSIONS_DIR:-/usr/lib/armada/sessions.d}"
+WAYLAND_SESSIONS_DIR="${ARMADA_WAYLAND_SESSIONS_DIR:-/usr/share/wayland-sessions}"
+SDDM_CONF_DIR="${ARMADA_SDDM_CONF_DIR:-/etc/sddm.conf.d}"
+SWITCH_LOCK="${ARMADA_SWITCH_LOCK:-/run/armada/session-switch.lock}"
+CONTROLLER_TYPE="${ARMADA_CONTROLLER_TYPE:-/usr/libexec/armada/controller-type}"
+SHORT_SESSION_TRACKER="${ARMADA_SHORT_SESSION_TRACKER:-/tmp/chimeraos-short-session-tracker}"
+PROC_DIR="${ARMADA_PROC_DIR:-/proc}"
+SESSION_USER=armada
+SESSION_UID=1000
+SESSION_RUNTIME_DIR="${ARMADA_SESSION_RUNTIME_DIR:-/run/user/${SESSION_UID}}"
+SESSION_BUS="${SESSION_RUNTIME_DIR}/bus"
+STEAM_UNIT=gamescope-session-plus@steam.service
+LOCK_WAIT=20
+SETTLE_WAIT=20
+
+log() {
+    logger -t session-control -- "$*" 2>/dev/null || true
+}
+
+as_user() {
+    sudo -u "${SESSION_USER}" env \
+        XDG_RUNTIME_DIR="${SESSION_RUNTIME_DIR}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${SESSION_BUS}" \
+        "$@"
+}
+
+user_unit_active() {
+    as_user systemctl --user is-active --quiet -- "$1"
+}
+
+user_session() {
+    loginctl list-sessions --json=short 2>/dev/null \
+        | jq -r --arg user "${SESSION_USER}" \
+            '[.[] | select(.user == $user and .seat == "seat0")] | first | .session // empty'
+}
+
+session_ended() {
+    local state
+    state=$(loginctl show-session -p State --value "$1" 2>&1) || true
+    [[ "${state}" == *"No session"* || "${state}" == closing ]]
+}
+
+valid_name() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ && "$1" != gamemode && "$1" != desktop ]]
+}
+
+read_dropin() {
+    local name=$1 file line desktop='' unit=''
+
+    DROPIN_DESKTOP=
+    DROPIN_UNIT=
+    valid_name "${name}" || return 1
+    file="${SESSIONS_DIR}/${name}.conf"
+    [[ -f "${file}" ]] || return 1
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            DESKTOP=*) desktop=${line#DESKTOP=} ;;
+            UNIT=*)    unit=${line#UNIT=} ;;
+        esac
+    done < "${file}"
+
+    if [[ ! "${desktop}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.desktop$ ]]; then
+        log "session ${name}: invalid DESKTOP, ignored"
+        return 1
+    fi
+    if [[ "${desktop}" == gamescope-session-steam.desktop || "${desktop}" == armada-plasma*.desktop ]]; then
+        log "session ${name}: DESKTOP ${desktop} is reserved, ignored"
+        return 1
+    fi
+    if [[ ! -f "${WAYLAND_SESSIONS_DIR}/${desktop}" ]]; then
+        log "session ${name}: ${desktop} not in ${WAYLAND_SESSIONS_DIR}, ignored"
+        return 1
+    fi
+    if [[ ! "${unit}" =~ ^gamescope-session-plus@[a-z0-9][a-z0-9-]*\.service$ || "${unit}" == "${STEAM_UNIT}" ]]; then
+        log "session ${name}: invalid UNIT, ignored"
+        return 1
+    fi
+
+    DROPIN_DESKTOP=${desktop}
+    DROPIN_UNIT=${unit}
+}
+
+list_sessions() {
+    local file name units=' '
+
+    [[ -d "${SESSIONS_DIR}" ]] || return 0
+    for file in "${SESSIONS_DIR}"/*.conf; do
+        [[ -f "${file}" ]] || continue
+        name=$(basename "${file}" .conf)
+        if ! valid_name "${name}"; then
+            log "session file ${file}: invalid name, ignored"
+            continue
+        fi
+        read_dropin "${name}" || continue
+        if [[ "${units}" == *" ${DROPIN_UNIT} "* ]]; then
+            log "session ${name}: ${DROPIN_UNIT} already used, ignored"
+            continue
+        fi
+        units+="${DROPIN_UNIT} "
+        printf '%s\n' "${name}"
+    done
+    return 0
+}
+
+active_dropin_unit() {
+    local name
+
+    [[ -n "${dropins}" && -S "${SESSION_BUS}" ]] || return 1
+    while IFS= read -r name; do
+        read_dropin "${name}" || continue
+        [[ "${DROPIN_UNIT}" == "${target_unit}" ]] && continue
+        if user_unit_active "${DROPIN_UNIT}"; then
+            printf '%s\n' "${DROPIN_UNIT}"
+            return 0
+        fi
+    done <<< "${dropins}"
+    return 1
+}
 
 logout_plasma() {
-    local user=armada
-    local uid=1000
-    local bus="/run/user/${uid}/bus"
-    local qdbus=
+    local user="${SESSION_USER}"
+    local bus="${SESSION_BUS}"
+    local qdbus='' candidate
 
     [[ -S "${bus}" ]] || return 1
 
@@ -28,9 +142,100 @@ logout_plasma() {
     [[ -n "${qdbus}" ]] || return 1
 
     sudo -Eu "${user}" env \
-        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        XDG_RUNTIME_DIR="${SESSION_RUNTIME_DIR}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
+        busctl --user status org.kde.Shutdown >/dev/null 2>&1 || return 1
+
+    sudo -Eu "${user}" env \
+        XDG_RUNTIME_DIR="${SESSION_RUNTIME_DIR}" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
         "${qdbus}" org.kde.Shutdown /Shutdown org.kde.Shutdown.logout
+}
+
+shutdown_steam() {
+    local home steam_dir session waited
+
+    [[ -S "${SESSION_BUS}" ]] || return 1
+    user_unit_active "${STEAM_UNIT}" || return 1
+
+    home=$(getent passwd "${SESSION_USER}" | cut -d: -f6)
+    steam_dir="${home}/.local/share/Steam/steamrtarm64"
+    [[ -x "${steam_dir}/steam" ]] || return 1
+    session=$(user_session) || session=
+    [[ -n "${session}" ]] || return 1
+
+    log "steam -shutdown HOME=${home} XDG_RUNTIME_DIR=${SESSION_RUNTIME_DIR} session=${session}"
+    timeout 15 sudo -u "${SESSION_USER}" env \
+        HOME="${home}" \
+        XDG_RUNTIME_DIR="${SESSION_RUNTIME_DIR}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${SESSION_BUS}" \
+        LD_LIBRARY_PATH="${steam_dir}" \
+        "${steam_dir}/steam" -shutdown 9>&- || return 1
+
+    waited=0
+    while user_unit_active "${STEAM_UNIT}"; do
+        (( waited >= 20 )) && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    waited=0
+    until session_ended "${session}"; do
+        (( waited >= 10 )) && return 1
+        sleep 1
+        waited=$((waited + 1))
+        user_unit_active "${STEAM_UNIT}" && return 1
+    done
+    return 0
+}
+
+desktop_shell_running() {
+    local pid cgroup
+
+    for pid in $(pgrep -u "${SESSION_USER}" -x plasmashell); do
+        cgroup=$(cat "${PROC_DIR}/${pid}/cgroup" 2>/dev/null) || continue
+        case "${cgroup}" in
+            *gamescope-session-plus@*|*armada-bottom-screen.service*|*armada-plasma-nested-*) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+target_up() {
+    if [[ -n "${target_unit}" ]]; then
+        user_unit_active "${target_unit}"
+    else
+        desktop_shell_running
+    fi
+}
+
+apply_controller_type() {
+    timeout 20 "${CONTROLLER_TYPE}" apply 9>&- || log "${verb}: controller-type apply failed"
+}
+
+settle() {
+    local waited=0
+
+    [[ -n "${dropins}" ]] || exit 0
+    if [[ "${verb}" == switch-gamemode || "${verb}" == switch-desktop ]]; then
+        apply_controller_type
+    fi
+
+    until target_up; do
+        if (( waited >= SETTLE_WAIT )); then
+            log "${verb}: target not up after ${SETTLE_WAIT} s"
+            exit 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    exit 0
+}
+
+usage() {
+    echo "usage: $0 {switch-desktop|switch-gamemode|default-gamemode|default-desktop|switch-<name>|default-<name>|list-sessions}" >&2
+    exit 1
 }
 
 source "${ARMADA_PLASMA_SESSION_LIB:-/usr/lib/armada/plasma-session-lib}"
@@ -40,22 +245,66 @@ if [[ "$(armada_plasma_shell "${STEAMOS_MANAGER_STATE}")" == mobile ]]; then
     desktop_session=armada-plasma-mobile.desktop
 fi
 
-case "${1:-}" in
-    switch-desktop|default-desktop)   session=$desktop_session ;;
-    switch-gamemode|default-gamemode) session=gamescope-session-steam.desktop ;;
-    *) echo "usage: $0 {switch-desktop|switch-gamemode|default-gamemode|default-desktop}" >&2; exit 1 ;;
+verb=${1:-}
+target_unit=
+dropins=$(list_sessions)
+
+case "${verb}" in
+    list-sessions)
+        [[ -z "${dropins}" ]] || printf '%s\n' "${dropins}"
+        exit 0 ;;
+    switch-desktop|default-desktop)
+        session=$desktop_session ;;
+    switch-gamemode|default-gamemode)
+        session=gamescope-session-steam.desktop
+        target_unit=${STEAM_UNIT} ;;
+    switch-*|default-*)
+        [[ $'\n'"${dropins}"$'\n' == *$'\n'"${verb#*-}"$'\n'* ]] || usage
+        read_dropin "${verb#*-}" || usage
+        session=${DROPIN_DESKTOP}
+        target_unit=${DROPIN_UNIT} ;;
+    *)
+        usage ;;
 esac
 
-printf '[Autologin]\nSession=%s\n' "${session}" > /etc/sddm.conf.d/zz-holo-autologin.conf
-rm -f /etc/sddm.conf.d/zz-steamos-autologin.conf
+mkdir -p "$(dirname "${SWITCH_LOCK}")"
+exec 9>"${SWITCH_LOCK}"
+if ! flock -w "${LOCK_WAIT}" 9; then
+    log "${verb}: switch in progress"
+    echo "switch in progress" >&2
+    exit 75
+fi
+
+printf '[Autologin]\nSession=%s\n' "${session}" > "${SDDM_CONF_DIR}/zz-holo-autologin.conf"
+rm -f "${SDDM_CONF_DIR}/zz-steamos-autologin.conf"
 systemctl reset-failed sddm.service 2>/dev/null || true
 
-if [[ "${1}" == default-* ]]; then
+if [[ "${verb}" == default-* ]]; then
     exit 0
 fi
 
-if [[ "${1}" == "switch-gamemode" ]] && logout_plasma; then
+if [[ -n "${dropins}" && -n "${target_unit}" && -S "${SESSION_BUS}" ]] && user_unit_active "${target_unit}"; then
     exit 0
+fi
+
+if active_unit=$(active_dropin_unit); then
+    if as_user systemctl --user stop -- "${active_unit}"; then
+        settle
+    fi
+    log "${verb}: stopping ${active_unit} failed"
+else
+    case "${verb}" in
+        switch-gamemode)
+            if logout_plasma; then settle; fi ;;
+        switch-desktop) ;;
+        *)
+            if logout_plasma; then settle; fi
+            if shutdown_steam; then
+                rm -f "${SHORT_SESSION_TRACKER}"
+                settle
+            fi ;;
+    esac
 fi
 
 systemctl --no-block restart sddm.service
+settle
