@@ -1,0 +1,10 @@
+[Unit]
+Description=Switch to the %i session
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+TimeoutStartSec=150
+ExecStart=/usr/libexec/armada/session-control switch-%i
+StandardOutput=journal
+StandardError=journal
